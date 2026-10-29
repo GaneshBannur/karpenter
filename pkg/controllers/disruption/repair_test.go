@@ -1066,6 +1066,133 @@ var _ = Describe("Repair", func() {
 		})).To(ContainElement(blockingPod.Name))
 	})
 
+	Context("draining a node with pods that block eviction", func() {
+		var replacementClaim *v1.NodeClaim
+		var replacement *corev1.Node
+
+		BeforeEach(func() {
+			// Consolidation may delete any empty node, so only a nomination keeps the replacement.
+			nodePool.Spec.Disruption = v1.Disruption{
+				ConsolidationPolicy: v1.ConsolidationPolicyWhenEmpty,
+				ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
+				Budgets:             []v1.Budget{{Nodes: "100%"}},
+			}
+			ExpectApplied(ctx, env.Client, nodePool)
+			// A draining NodeClaim stays until its node is gone, so it keeps the finalizer the termination controller removes.
+			nodeClaim.Finalizers = []string{v1.TerminationFinalizer}
+			replacementClaim, replacement = test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels()},
+				Status: v1.NodeClaimStatus{Allocatable: corev1.ResourceList{
+					corev1.ResourceCPU:  resource.MustParse("32"),
+					corev1.ResourcePods: resource.MustParse("100"),
+				}},
+			})
+			replacementClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		})
+
+		// drainNode deletes the NodeClaim the way a disruption command does, with its reason and an optional deadline.
+		drainNode := func(reason v1.DisruptionReason, deadline bool) {
+			nc := ExpectExists(ctx, env.Client, nodeClaim)
+			if deadline {
+				nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
+					v1.NodeClaimTerminationTimestampAnnotationKey: env.Clock.Now().Add(5 * time.Minute).Format(time.RFC3339),
+				})
+			}
+			nc.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(reason), string(reason))
+			ExpectApplied(ctx, env.Client, nc)
+			Expect(env.Client.Delete(ctx, nc)).To(Succeed())
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
+		}
+		bindBlockedByPDB := func(n *corev1.Node) {
+			podLabels := map[string]string{"repair-pdb": "true"}
+			pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: podLabels}})
+			ExpectApplied(ctx, env.Client, pod, test.PodDisruptionBudget(test.PDBOptions{Labels: podLabels, MaxUnavailable: fromInt(0)}))
+			ExpectManualBinding(ctx, env.Client, pod, n)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+		}
+		// provision runs one provisioning pass, as the provisioner does every 10 seconds while a node drains.
+		provision := func() {
+			results, err := prov.Schedule(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(results.NewNodeClaims).To(BeEmpty())
+			results.Record(ctx, recorder, cluster)
+		}
+		// consolidate runs one consolidation pass and returns the commands it queued.
+		consolidate := func() []*disruption.Command {
+			cluster.MarkUnconsolidated()
+			consolidation := disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+				disruption.WithMethods(NewMethodsWithNopValidator()...))
+			ExpectSingletonReconciled(ctx, consolidation)
+			return queue.GetCommands()
+		}
+
+		It("should keep the replacement nominated for a do-not-disrupt pod", func() {
+			initNode(nodeClaim, node)
+			bindBlockingPod(node)
+			initNode(replacementClaim, replacement)
+			drainNode(v1.DisruptionReasonUnhealthy, true)
+
+			provision()
+			Expect(cluster.IsNodeNominated(replacement.Spec.ProviderID)).To(BeTrue())
+			Expect(consolidate()).To(BeEmpty())
+		})
+		It("should keep the replacement nominated for a pod behind a fully blocking PDB", func() {
+			initNode(nodeClaim, node)
+			bindBlockedByPDB(node)
+			initNode(replacementClaim, replacement)
+			drainNode(v1.DisruptionReasonUnhealthy, true)
+
+			provision()
+			Expect(cluster.IsNodeNominated(replacement.Spec.ProviderID)).To(BeTrue())
+			Expect(consolidate()).To(BeEmpty())
+		})
+		It("should keep the replacement it launched nominated after the command finishes", func() {
+			useRepairPolicies([]cloudprovider.RepairPolicy{
+				{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(5 * time.Minute), Action: cloudprovider.ReplaceNode},
+			})
+			newRepairController()
+			initNode(nodeClaim, node)
+			bindBlockingPod(node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+			// Outlast the nomination the command made, so only provisioning can renew it.
+			env.Clock.Step(time.Minute)
+
+			provision()
+			launched := ExpectExists(ctx, env.Client, &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: cmds[0].Replacements[0].Name}})
+			Expect(cluster.IsNodeNominated(launched.Status.ProviderID)).To(BeTrue())
+		})
+		It("should not count a do-not-disrupt pod on a node drained for drift", func() {
+			initNode(nodeClaim, node)
+			bindBlockingPod(node)
+			initNode(replacementClaim, replacement)
+			drainNode(v1.DisruptionReasonDrifted, true)
+
+			provision()
+			Expect(cluster.IsNodeNominated(replacement.Spec.ProviderID)).To(BeFalse())
+			cmds := consolidate()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Candidates[0].Name()).To(Equal(replacement.Name))
+		})
+		It("should not count a do-not-disrupt pod when the repair drain has no deadline", func() {
+			initNode(nodeClaim, node)
+			bindBlockingPod(node)
+			initNode(replacementClaim, replacement)
+			drainNode(v1.DisruptionReasonUnhealthy, false)
+
+			provision()
+			Expect(cluster.IsNodeNominated(replacement.Spec.ProviderID)).To(BeFalse())
+		})
+	})
+
 	It("should repair a static NodePool with a one-for-one replacement from the same pool", func() {
 		nodePool = test.StaticNodePool(v1.NodePool{
 			Spec: v1.NodePoolSpec{

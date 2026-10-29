@@ -352,7 +352,24 @@ func (in *StateNode) CurrentlyReschedulablePods(ctx context.Context, kubeClient 
 	if in.Node == nil {
 		return nil, nil
 	}
+	// Repair launches capacity for pods that block eviction, since its deadline will force them off.
+	// Count them so that capacity stays nominated until they move.
+	if in.repairDrainHasDeadline() {
+		return nodeutils.ReschedulablePods(ctx, kubeClient, in.Node.Name)
+	}
 	return nodeutils.GetCurrentlyReschedulablePods(ctx, kubeClient, clk, recorder, in.Node)
+}
+
+// repairDrainHasDeadline returns true if repair is draining the node and its NodeClaim has a termination deadline.
+func (in *StateNode) repairDrainHasDeadline() bool {
+	if in.NodeClaim == nil {
+		return false
+	}
+	if _, ok := in.NodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; !ok {
+		return false
+	}
+	cond := in.NodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason)
+	return cond.IsTrue() && cond.Reason == string(v1.DisruptionReasonUnhealthy)
 }
 
 func (in *StateNode) HostName() string {
