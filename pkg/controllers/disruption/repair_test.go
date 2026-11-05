@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
@@ -74,6 +75,22 @@ func (c *terminationTimestampPatchErrorClient) Patch(ctx context.Context, obj cl
 		return c.err
 	}
 	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+type nodeListErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c *nodeListErrorClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.NodeList); ok && c.err != nil {
+		return c.err
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+func blockedLabels(np *v1.NodePool, reason string) map[string]string {
+	return map[string]string{metrics.NodePoolLabel: np.Name, disruption.RepairBlockedReason.Name: reason}
 }
 
 // tickingClock is a fake clock that moves on a millisecond every time it is read.
@@ -154,6 +171,14 @@ var _ = Describe("Repair", func() {
 	}
 	markUnhealthy := func(n *corev1.Node, condType corev1.NodeConditionType) {
 		markUnhealthyWithReason(n, condType, "")
+	}
+
+	// expectNoneBlocked checks that no node in the NodePool is counted as blocked, under any reason.
+	expectNoneBlocked := func(np *v1.NodePool) {
+		GinkgoHelper()
+		_, found := FindMetricWithLabelValues(ExpectMetricName(disruption.NodeClaimsUnhealthyBlocked.(*opmetrics.PrometheusGauge)),
+			map[string]string{metrics.NodePoolLabel: np.Name})
+		Expect(found).To(BeFalse())
 	}
 
 	// newRepairController builds an isolated repair-only disruption controller around the suite's repair policy matcher,
@@ -1380,6 +1405,257 @@ var _ = Describe("Repair", func() {
 
 			ExpectSingletonReconciled(ctx, repairController)
 			Expect(queue.GetCommands()).To(BeEmpty())
+		})
+
+		// registerRoomyNode registers a node with room for the candidate's pods that never initializes.
+		registerRoomyNode := func() {
+			nc, n := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels()},
+				Status: v1.NodeClaimStatus{
+					Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("32"), corev1.ResourcePods: resource.MustParse("100")},
+				},
+			})
+			registerNode(nc, n)
+		}
+
+		It("should count a node whose pods only wait for a node that is still initializing as waiting on it", func() {
+			initNode(nodeClaim, node)
+			bindReschedulablePod(node)
+			registerRoomyNode()
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(BeEmpty())
+			_, waited := lo.Find(recorder.Events(), func(e karpenterevents.Event) bool {
+				return strings.Contains(e.Message, "would schedule against uninitialized nodeclaim")
+			})
+			Expect(waited).To(BeTrue())
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedWaitingOnInitialization.Name))
+		})
+
+		It("should count a node whose pods wait for an initializing node when another pod can't be scheduled at all", func() {
+			initNode(nodeClaim, node)
+			bindReschedulablePod(node)
+			// No node can take a pod pinned to a zone that doesn't exist, so waiting alone doesn't explain the block.
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+			pinned := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: new(true), BlockOwnerDeletion: new(true),
+				}}},
+				NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-missing"},
+			})
+			ExpectApplied(ctx, env.Client, pinned)
+			ExpectManualBinding(ctx, env.Client, pinned, node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+			registerRoomyNode()
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedNoReplacement.Name))
+		})
+	})
+
+	Context("blocked nodes metric", func() {
+		It("should count a node vetoed by the do-not-repair annotation", func() {
+			node.Annotations = lo.Assign(node.Annotations, map[string]string{v1.DoNotRepairAnnotationKey: "true"})
+			initNode(nodeClaim, node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedDoNotRepair.Name))
+		})
+
+		It("should not count a node that is still within its policy's toleration", func() {
+			node.Annotations = lo.Assign(node.Annotations, map[string]string{v1.DoNotRepairAnnotationKey: "true"})
+			initNode(nodeClaim, node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(29 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			expectNoneBlocked(nodePool)
+		})
+
+		It("should count a node whose blocking pods have no bounded drain", func() {
+			initNode(nodeClaim, node)
+			bindBlockingPod(node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBlockingPods.Name))
+		})
+
+		It("should count only eligible nodes held back by the breaker", func() {
+			nodeClaims, nodes := test.NodeClaimsAndNodes(10, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+			for i := range nodes {
+				initNode(nodeClaims[i], nodes[i])
+			}
+			// Three unhealthy nodes trip the breaker, but only the first is past its toleration, so only it counts.
+			markUnhealthy(nodes[0], "BadNode")
+			env.Clock.Step(31 * time.Minute)
+			markUnhealthy(nodes[1], "BadNode")
+			markUnhealthy(nodes[2], "BadNode")
+
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBreaker.Name))
+		})
+
+		It("should count nodes under the breaker when their nodepool is also out of budget", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+			for i := range nodes {
+				initNode(nodeClaims[i], nodes[i])
+			}
+			// Two of three nodes unhealthy trips the 20% breaker.
+			markUnhealthy(nodes[0], "BadNode")
+			markUnhealthy(nodes[1], "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 2, blockedLabels(nodePool, disruption.RepairBlockedBreaker.Name))
+		})
+
+		It("should count a vetoed node under do-not-repair even when its nodepool's breaker is tripped", func() {
+			nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+			nodes[0].Annotations = lo.Assign(nodes[0].Annotations, map[string]string{v1.DoNotRepairAnnotationKey: "true"})
+			for i := range nodes {
+				initNode(nodeClaims[i], nodes[i])
+			}
+			// Two of three nodes unhealthy trips the 20% breaker.
+			markUnhealthy(nodes[0], "BadNode")
+			markUnhealthy(nodes[1], "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedDoNotRepair.Name))
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBreaker.Name))
+		})
+
+		It("should count breaker blocks even when repair acts on another nodepool first", func() {
+			otherNodePool := test.NodePool()
+			ExpectApplied(ctx, env.Client, otherNodePool)
+			otherNodeClaim, otherNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey: otherNodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a",
+			}}})
+			initNode(otherNodeClaim, otherNode)
+			// The other node has been unhealthy longer, so it scores higher and repair acts on it first.
+			markUnhealthy(otherNode, "BadNode")
+			env.Clock.Step(10 * time.Minute)
+			nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+			for i := range nodes {
+				initNode(nodeClaims[i], nodes[i])
+			}
+			markUnhealthy(nodes[0], "BadNode")
+			markUnhealthy(nodes[1], "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Candidates[0].NodePool.Name).To(Equal(otherNodePool.Name))
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 2, blockedLabels(nodePool, disruption.RepairBlockedBreaker.Name))
+			expectNoneBlocked(otherNodePool)
+		})
+
+		It("should count a node in a static nodepool at its node limit when terminate-first is off", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true), TerminateFirstRepair: new(false)}}))
+			nodePool = test.StaticNodePool(v1.NodePool{
+				Spec: v1.NodePoolSpec{
+					Replicas: lo.ToPtr[int64](5),
+					Limits:   v1.Limits{resources.Node: resource.MustParse("5")},
+					Disruption: v1.Disruption{
+						Budgets: []v1.Budget{{Nodes: "100%"}},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool)
+			nodeClaims, nodes := test.NodeClaimsAndNodes(5, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+			for i := range nodes {
+				initNode(nodeClaims[i], nodes[i])
+			}
+			markUnhealthy(nodes[0], "BadNode")
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedNoReplacement.Name))
+		})
+
+		It("should stop counting a node once it recovers", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			initNode(nodeClaim, node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBudget.Name))
+
+			node = ExpectExists(ctx, env.Client, node)
+			node.Status.Conditions = lo.Reject(node.Status.Conditions, func(c corev1.NodeCondition, _ int) bool { return c.Type == "BadNode" })
+			ExpectApplied(ctx, env.Client, node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+			ExpectSingletonReconciled(ctx, repairController)
+			expectNoneBlocked(nodePool)
+		})
+
+		It("should stop counting a node once repair acts on it", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			initNode(nodeClaim, node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBudget.Name))
+
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(HaveLen(1))
+			expectNoneBlocked(nodePool)
+		})
+
+		It("should keep the last counts when a repair pass fails", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			failingClient := &nodeListErrorClient{Client: env.Client}
+			failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, failingClient, prov, cloudProvider, recorder, queue))
+			failingController := disruption.NewController(ctx, env.Clock, failingClient, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+				disruption.WithMethods(failingRepair))
+			initNode(nodeClaim, node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+			ExpectSingletonReconciled(ctx, failingController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBudget.Name))
+
+			// The breaker's Node list fails, so the pass stops before it checks the budget again.
+			failingClient.err = errors.New("injected node list failure")
+			Expect(ExpectSingletonReconcileFailed(ctx, failingController)).To(MatchError(ContainSubstring("injected node list failure")))
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBudget.Name))
+		})
+
+		It("should update the counts when a repair pass fails after checking the breaker and budget", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			initNode(nodeClaim, node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(31 * time.Minute)
+			ExpectSingletonReconciled(ctx, repairController)
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedBudget.Name))
+
+			// With the budget lifted and the nodepool NotReady, the replacement simulation finds no nodepools and the pass
+			// fails, but only after the budget check, so the stale budget count is dropped.
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%"}}
+			nodePool.StatusConditions().SetFalse(v1.ConditionTypeValidationSucceeded, "NotReady", "NotReady")
+			ExpectApplied(ctx, env.Client, nodePool)
+			Expect(ExpectSingletonReconcileFailed(ctx, repairController)).To(MatchError(ContainSubstring("no nodepools found")))
+			expectNoneBlocked(nodePool)
 		})
 	})
 })

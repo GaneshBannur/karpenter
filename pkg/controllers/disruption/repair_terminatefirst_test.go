@@ -272,6 +272,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		Expect(queue.GetCommands()).To(HaveLen(0))
 		// Blocked (not silently skipped): with the gate off the full reservation can't pre-spin, so repair is blocked.
 		Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+		ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedNoReplacement.Name))
 	})
 
 	// INV-F2-2: a normal (dynamic, headroom) NodePool still replaces-first — a pre-spun replacement is created.
@@ -679,9 +680,11 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		// replacement can't launch into the full reservations either, so it's blocked.
 		It("should block when the reservation is full and the node's reservation is no longer offered", func() {
 			withReservation(0)
-			repairNodeInReservation(reservedStaticNodePool(v1.CapacityTypeReserved), "r-canceled")
+			nodePool := reservedStaticNodePool(v1.CapacityTypeReserved)
+			repairNodeInReservation(nodePool, "r-canceled")
 
 			Expect(queue.GetCommands()).To(HaveLen(0))
+			ExpectMetricGaugeValue(disruption.NodeClaimsUnhealthyBlocked, 1, blockedLabels(nodePool, disruption.RepairBlockedNoReplacement.Name))
 			Expect(recorder.DetectedEvent("static NodePool's capacity reservations are full and cannot stage a replacement")).To(BeTrue())
 		})
 

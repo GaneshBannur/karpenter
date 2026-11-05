@@ -194,11 +194,16 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
-func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+func (c *Controller) disrupt(ctx context.Context, disruption Method) (_ bool, err error) {
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
+	if observer, ok := disruption.(passObserver); ok {
+		observer.startPass()
+		// A closure, because a plain defer would read err now, while it's still nil.
+		defer func() { observer.endPass(err) }()
+	}
 	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)

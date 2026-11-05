@@ -24,6 +24,7 @@ import (
 	"sort"
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -38,7 +39,9 @@ import (
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -56,6 +59,20 @@ type Repair struct {
 	consolidation
 	policyMatcher *health.RepairPolicyMatcher
 	rebootHistory *RebootHistory
+	// blocked holds each node repair held back this pass, keyed by provider ID so a node is counted once.
+	blocked map[string]blockedNode
+	// checked is set once this pass has checked the breaker and budget for every candidate, so its counts are complete
+	// even if the pass fails later.
+	checked bool
+	// blockedStore sets the new counts before deleting series that dropped out, so a scrape never sees the gauge empty.
+	blockedStore *metrics.Store
+}
+
+var _ passObserver = (*Repair)(nil)
+
+type blockedNode struct {
+	nodePool string
+	reason   string
 }
 
 // NewRepair constructs the repair method around the matcher cluster state matches Nodes with. It panics when cluster
@@ -69,6 +86,8 @@ func NewRepair(c consolidation) *Repair {
 		consolidation: c,
 		policyMatcher: policyMatcher,
 		rebootHistory: newRebootHistory(c.clock),
+		blocked:       map[string]blockedNode{},
+		blockedStore:  metrics.NewStore(),
 	}
 }
 
@@ -97,11 +116,13 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	if c.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
 		r.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim,
 			fmt.Sprintf("repair is blocked through the %q annotation", v1.DoNotRepairAnnotationKey))...)
+		r.block(c, RepairBlockedDoNotRepair)
 		return false
 	}
 	if c.hasPodBlockers && c.RepairPolicyResult.TerminationGracePeriod == nil && c.NodeClaim.Spec.TerminationGracePeriod == nil {
 		r.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim,
 			"repair requires a termination grace period to bypass blocking pods")...)
+		r.block(c, RepairBlockedBlockingPods)
 		return false
 	}
 	return true
@@ -142,17 +163,25 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 	if err != nil {
 		return []Command{}, err
 	}
+	// Breaker and budget blocks are checked for every candidate up front, so each blocked node is counted even though the
+	// loop below stops at the first candidate it acts on.
+	var actionable []*Candidate
 	for _, candidate := range candidates {
-		if trippedPools[candidate.NodePool.Name] {
+		switch {
+		case trippedPools[candidate.NodePool.Name]:
 			r.recorder.Publish(disruptionevents.NodeRepairBlocked(candidate.Node, candidate.NodeClaim, candidate.NodePool,
 				fmt.Sprintf("more than %s of nodes in nodepool %q are unhealthy", repairUnhealthyThreshold, candidate.NodePool.Name))...)
-			continue
-		}
+			r.block(candidate, RepairBlockedBreaker)
 		// Budgets only count initialized nodes, since an uninitialized node runs no workload to protect, so repairing one
 		// neither needs nor consumes budget.
-		if candidate.Initialized() && disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			continue
+		case candidate.Initialized() && disruptionBudgetMapping[candidate.NodePool.Name] == 0:
+			r.block(candidate, RepairBlockedBudget)
+		default:
+			actionable = append(actionable, candidate)
 		}
+	}
+	r.checked = true
+	for _, candidate := range actionable {
 		// Repair admits nodes with blocking (PDB / do-not-disrupt) pods only on the promise of this drain bound, so it
 		// must be stamped before either replacement path returns a command.
 		candidate.TerminationGracePeriod = effectiveDrainBound(candidate, candidate.RepairPolicyResult)
@@ -197,6 +226,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 				}
 				if full && !holdsOfferedReservation(candidate, offered) {
 					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool's capacity reservations are full and cannot stage a replacement")...)
+					r.block(candidate, RepairBlockedNoReplacement)
 					continue
 				}
 				reservationsFull = full
@@ -215,6 +245,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, lo.Ternary(reservationsFull,
 						"static NodePool's capacity reservations are full and cannot stage a replacement",
 						"static NodePool is at its node limit and cannot stage a replacement"))...)
+					r.block(candidate, RepairBlockedNoReplacement)
 					continue
 				}
 				return []Command{{
@@ -251,6 +282,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		}
 		if !results.AllNonPendingPodsScheduled() {
 			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
+			r.block(candidate, lo.Ternary(waitingOnUninitializedNodes(results), RepairBlockedWaitingOnInitialization, RepairBlockedNoReplacement))
 			continue
 		}
 		return []Command{{
@@ -338,6 +370,55 @@ func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, erro
 		}
 	}
 	return tripped, nil
+}
+
+// waitingOnUninitializedNodes reports whether every non-pending pod that wouldn't schedule only waits for a node that
+// hasn't initialized yet. Waiting on a node that's still starting differs from having no replacement, so it's counted
+// separately.
+func waitingOnUninitializedNodes(results pscheduling.Results) bool {
+	waiting := false
+	for p, err := range results.PodErrors {
+		if pod.IsProvisionable(p) {
+			continue
+		}
+		if _, ok := lo.ErrorsAs[*UninitializedNodeError](err); !ok {
+			return false
+		}
+		waiting = true
+	}
+	return waiting
+}
+
+// block records that repair held back the candidate this pass, and why. A node keeps the first reason recorded for it.
+func (r *Repair) block(c *Candidate, reason opmetrics.Value) {
+	if _, ok := r.blocked[c.ProviderID()]; !ok {
+		r.blocked[c.ProviderID()] = blockedNode{nodePool: c.NodePool.Name, reason: reason.Name}
+	}
+}
+
+// startPass clears the previous pass's nodes, so nodes no longer held back stop being counted.
+func (r *Repair) startPass() {
+	r.blocked = map[string]blockedNode{}
+	r.checked = false
+}
+
+// endPass publishes how many nodes repair held back this pass, by NodePool and reason. A pass that fails before it
+// checks the breaker and budget has incomplete counts, so the gauge keeps the last complete ones.
+func (r *Repair) endPass(err error) {
+	if err != nil && !r.checked {
+		return
+	}
+	counts := map[blockedNode]int{}
+	for _, b := range r.blocked {
+		counts[b]++
+	}
+	r.blockedStore.Update("blocked", lo.MapToSlice(counts, func(b blockedNode, count int) *metrics.StoreMetric {
+		return &metrics.StoreMetric{
+			GaugeMetric: NodeClaimsUnhealthyBlocked,
+			Value:       float64(count),
+			Labels:      map[string]string{metrics.NodePoolLabel: b.nodePool, repairBlockedReasonLabel: b.reason},
+		}
+	}))
 }
 
 // effectiveDrainBound returns the drain bound for the candidate, carried on the Command and applied by the queue

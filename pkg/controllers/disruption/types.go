@@ -75,6 +75,13 @@ type Method interface {
 	ConsolidationType() string
 }
 
+// passObserver is implemented by methods that keep state for a single pass. The controller calls startPass before
+// gathering candidates, and endPass with the pass's error when it returns, even when there are no candidates.
+type passObserver interface {
+	startPass()
+	endPass(err error)
+}
+
 type CandidateFilter func(context.Context, *Candidate) bool
 
 // Candidate is a state.StateNode that we are considering for disruption along with extra information to be used in

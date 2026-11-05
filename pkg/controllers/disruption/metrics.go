@@ -275,11 +275,25 @@ var (
 		[]opmetrics.Label{RepairCondition, metrics.NodePool, metrics.CapacityType, ImageID, metrics.TerminationMode},
 		opmetrics.Alpha,
 	)
+	// NodeClaimsUnhealthyBlocked tells a stalled repair apart from one with nothing to do. Unlike EligibleNodes, it says
+	// why, per NodePool, and also counts nodes vetoed by do-not-repair or blocking pods.
+	NodeClaimsUnhealthyBlocked = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodeClaimSubsystem,
+			Name:      "unhealthy_blocked",
+			Help:      "Number of unhealthy nodeclaims past their repair toleration that node repair is holding back. Labeled by the owning nodepool and why repair is holding them back. Nodes that repair skips before checking them, such as nodes nominated for pending pods, aren't counted. Updated after each repair pass; a pass that fails before checking every candidate keeps the previous value.",
+		},
+		[]opmetrics.Label{metrics.NodePool, RepairBlockedReason},
+		opmetrics.Alpha,
+	)
 )
 
 const (
-	conditionLabel = "condition"
-	imageIDLabel   = "image_id"
+	conditionLabel           = "condition"
+	imageIDLabel             = "image_id"
+	repairBlockedReasonLabel = "blocked_reason"
 )
 
 var (
@@ -290,5 +304,39 @@ var (
 	ImageID = opmetrics.Label{
 		Name: imageIDLabel,
 		Help: "The image ID of the node that was disrupted.",
+	}
+)
+
+var (
+	RepairBlockedDoNotRepair = opmetrics.Value{
+		Name: "do-not-repair",
+		Help: "The node carries the karpenter.sh/do-not-repair: \"true\" annotation.",
+	}
+	RepairBlockedBlockingPods = opmetrics.Value{
+		Name: "blocking-pods",
+		Help: "The node has pods that block eviction, such as do-not-disrupt pods or pods whose PodDisruptionBudget allows no disruptions right now, and neither the repair policy nor the nodeclaim sets a termination grace period.",
+	}
+	RepairBlockedBreaker = opmetrics.Value{
+		Name: "breaker",
+		Help: "More than " + repairUnhealthyThreshold + " of the nodepool's nodes are unhealthy, so repair is paused for the nodepool.",
+	}
+	RepairBlockedBudget = opmetrics.Value{
+		Name: "budget",
+		Help: "The nodepool's disruption budget allows no more Unhealthy disruptions right now: it's set to zero, disruptions in progress use it all, or one of its budgets is misconfigured.",
+	}
+	RepairBlockedNoReplacement = opmetrics.Value{
+		Name: "no-replacement",
+		Help: "Repair can't stage a replacement: some pods can't be scheduled elsewhere, or a static nodepool is at its node limit or its capacity reservations are full. Can undercount, since each pass stops checking nodes once repair acts on one.",
+	}
+	RepairBlockedWaitingOnInitialization = opmetrics.Value{
+		Name: "waiting-on-initialization",
+		Help: "The node's pods would only fit on a node that hasn't finished initializing, so repair waits for it. This is usually brief; a long wait means that node is stuck starting. Can undercount, like no-replacement.",
+	}
+	RepairBlockedReason = opmetrics.Label{
+		Name: repairBlockedReasonLabel,
+		Help: "Why node repair is holding back an unhealthy node. Each node is counted once, under the first reason that applies, in the order listed.",
+		// Listed in the order repair checks them, which the Help relies on.
+		Values: []opmetrics.Value{RepairBlockedDoNotRepair, RepairBlockedBlockingPods, RepairBlockedBreaker, RepairBlockedBudget, RepairBlockedNoReplacement,
+			RepairBlockedWaitingOnInitialization},
 	}
 )
