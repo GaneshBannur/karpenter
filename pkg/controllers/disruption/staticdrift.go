@@ -143,23 +143,21 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 }
 
 // unreplaceableCommands handles a NodePool's candidates when it can't stage a replacement: with TerminateFirstDrift, each
-// candidate that canTerminateFirst gets a delete-only command; every other candidate is reported blocked.
+// candidate that canTerminateFirst gets a delete-only command if the NodePool can be refilled; the rest are blocked.
 func (d *StaticDrift) unreplaceableCommands(ctx context.Context, np *v1.NodePool, candidates []*Candidate, canTerminateFirst func(*Candidate) bool,
 	reason TerminateFirstReason, blockedReason string) []Command {
-	// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand the workload
-	// with no replacement.
-	terminateFirst := options.FromContext(ctx).FeatureGates.TerminateFirstDrift && np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
+	terminateFirstEnabled := options.FromContext(ctx).FeatureGates.TerminateFirstDrift
 	var cmds []Command
 	for _, c := range candidates {
-		if terminateFirst && canTerminateFirst(c) {
-			cmds = append(cmds, Command{
-				Candidates:           []*Candidate{c},
-				PoolDisruptionCosts:  computePoolDisruptionCosts([]*Candidate{c}),
-				TerminateFirstReason: reason,
-			})
+		if msg, blocked := staticBlockedReason(np, terminateFirstEnabled && canTerminateFirst(c), blockedReason); blocked {
+			d.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, msg)...)
 			continue
 		}
-		d.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, blockedReason)...)
+		cmds = append(cmds, Command{
+			Candidates:           []*Candidate{c},
+			PoolDisruptionCosts:  computePoolDisruptionCosts([]*Candidate{c}),
+			TerminateFirstReason: reason,
+		})
 	}
 	return cmds
 }

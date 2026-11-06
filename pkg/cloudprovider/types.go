@@ -101,7 +101,9 @@ type RepairPolicy struct {
 	// TolerationDuration is added to the NodeCondition LastTransitionTime to determine when this policy becomes eligible.
 	TolerationDuration time.Duration
 	// TerminationGracePeriod is the Axis-2 drain bound for repair of this condition:
-	//   nil      -> inherit the NodePool/NodeClaim TerminationGracePeriod
+	//   nil      -> inherit the NodePool/NodeClaim TerminationGracePeriod. If neither the NodeClaim nor another
+	//               eligible policy for the node sets one, the node isn't repaired while its pods block eviction
+	//               (PDBs or pods with karpenter.sh/do-not-disrupt).
 	//   non-zero -> min(this, nodeclaim.TerminationGracePeriod) — bound the drain even on a pool that set none,
 	//               so repair cannot wait indefinitely on eviction.
 	//   0        -> forceful: skip the drain for conditions the kubelet can't evict through (wedged kernel,
@@ -665,9 +667,12 @@ func (i InstanceTypeOverhead) Total() corev1.ResourceList {
 // Requirements are required to contain the keys v1.CapacityTypeLabelKey and corev1.LabelTopologyZone.
 // +k8s:deepcopy-gen=true
 type Offering struct {
-	Requirements        scheduling.Requirements
-	Price               float64
-	Available           bool
+	Requirements scheduling.Requirements
+	Price        float64
+	// Available is true when the offering is healthy. A full reservation is still healthy: keep it Available, with a
+	// ReservationCapacity of 0 (see Offering.Launchable).
+	Available bool
+	// ReservationCapacity is the number of free slots in a reserved offering's capacity reservation.
 	ReservationCapacity int
 
 	// CapacityOverride specifies resource overrides for this offering's capacity.
@@ -850,8 +855,8 @@ func IgnoreNodeClaimNotFoundError(err error) error {
 }
 
 // NodeRebootNotImplementedError is returned by CloudProviders that do not support in-place reboot.
-// The reboot controller treats it as a terminal, non-retryable signal that reboot is unavailable
-// for this provider (so a reboot policy that requires it is rejected at startup validation).
+// The reboot controller fails the reboot without retrying. A provider that returns it shouldn't list RebootNode
+// repair policies, because each such reboot fails and the node is then replaced.
 type NodeRebootNotImplementedError struct{}
 
 func NewNodeRebootNotImplementedError() *NodeRebootNotImplementedError {

@@ -407,6 +407,23 @@ func TestGetCommandEstimatedSavings_EdgeCases(t *testing.T) {
 			},
 			expectedSavings: 0.0, // No candidates, so sourcePrice = 0
 		},
+		{
+			name: "terminate-first - static NodePool at its node limit",
+			cmd: Command{
+				Candidates:           []*Candidate{{Price: 0.50}},
+				TerminateFirstReason: TerminateFirstStaticAtLimit,
+			},
+			expectedSavings: 0.0, // A new node takes the freed slot, so nothing is saved
+		},
+		{
+			name: "terminate-first - full capacity reservation",
+			cmd: Command{
+				Candidates:           []*Candidate{{Price: 0.50}},
+				Results:              scheduling.Results{NewNodeClaims: []*scheduling.NodeClaim{{}}},
+				TerminateFirstReason: TerminateFirstNoReservedCapacity,
+			},
+			expectedSavings: 0.0,
+		},
 	}
 
 	for _, tt := range tests {

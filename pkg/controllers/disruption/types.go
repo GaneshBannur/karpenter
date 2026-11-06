@@ -410,6 +410,10 @@ func (c Command) EstimatedSavings() float64 {
 	if c.Reboot {
 		return 0
 	}
+	// Terminate-first deletes the node only so a new one can take its slot, so it saves nothing either.
+	if c.TerminateFirstReason != "" {
+		return 0
+	}
 	sourcePrice := c.SourceCost()
 
 	// For delete consolidation, all source cost is savings

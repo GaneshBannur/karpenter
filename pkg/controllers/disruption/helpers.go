@@ -478,3 +478,18 @@ func staticReservations(ctx context.Context, cloudProvider cloudprovider.CloudPr
 func holdsOfferedReservation(c *Candidate, offered sets.Set[string]) bool {
 	return c.capacityType == v1.CapacityTypeReserved && offered.Has(c.Labels()[cloudprovider.ReservationIDLabel])
 }
+
+// staticBlockedReason reports whether a static candidate that can't stage a replacement is blocked, and why. A
+// candidate that wants to terminate first is still blocked if static provisioning won't refill its NodePool.
+func staticBlockedReason(np *v1.NodePool, wantTerminateFirst bool, reason string) (string, bool) {
+	switch {
+	case !wantTerminateFirst:
+		return reason, true
+	case !np.DeletionTimestamp.IsZero():
+		return reason + ", and the node cannot be terminated first because the NodePool is being deleted", true
+	case !np.StatusConditions().Root().IsTrue():
+		return reason + ", and the node cannot be terminated first because the NodePool is not Ready", true
+	default:
+		return "", false
+	}
+}

@@ -152,7 +152,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			ExpectSingletonReconciled(ctx, staticDriftController)
 
 			Expect(queue.GetCommands()).To(HaveLen(0))
-			Expect(recorder.DetectedEvent("static NodePool is at its node limit and cannot stage a replacement")).To(BeTrue())
+			Expect(recorder.DetectedEvent("static NodePool is at its node limit and cannot stage a replacement, and the node cannot be terminated first because the NodePool is not Ready")).To(BeTrue())
 		})
 
 		It("replaces-first for a static NodePool below its node limit even when TerminateFirstDrift is enabled", func() {

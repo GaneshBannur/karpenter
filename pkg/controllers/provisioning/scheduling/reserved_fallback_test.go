@@ -113,6 +113,8 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 		Expect(results.NewNodeClaims).To(HaveLen(0))
 		Expect(results.PodErrors).To(HaveKey(pod))
 		Expect(results.ReservedOfferingErrors()).ToNot(HaveKey(pod))
+		// There's no other NodePool to take the pod, so the error must not mention one.
+		Expect(results.PodErrors[pod]).To(MatchError("all compatible reserved offerings are full and no on-demand or spot fallback is available"))
 	})
 
 	It("fallback: a reservation that still has capacity is reserved normally (regression guard)", func() {
