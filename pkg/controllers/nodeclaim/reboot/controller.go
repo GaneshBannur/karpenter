@@ -31,8 +31,10 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -163,6 +165,9 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 	}
 	// Fence new scheduling before draining.
 	if err := c.ensureRebootTaint(ctx, node); err != nil {
+		if errors.IsConflict(err) {
+			return reconcile.Result{Requeue: true}, nil
+		}
 		return reconcile.Result{}, err
 	}
 
@@ -400,16 +405,28 @@ func (c *Controller) ensureRebootTaint(ctx context.Context, node *corev1.Node) e
 	}
 	stored := node.DeepCopy()
 	node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
-	return c.kubeClient.Patch(ctx, node, client.MergeFrom(stored))
+	// Use optimistic locking because a merge patch replaces the whole taint list and would undo changes made after the Node was read.
+	return c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 }
 
 func (c *Controller) removeRebootTaint(ctx context.Context, node *corev1.Node) error {
-	stored := node.DeepCopy()
-	node.Spec.Taints = lo.Reject(node.Spec.Taints, func(t corev1.Taint, _ int) bool { return t.MatchTaint(&v1.RebootingNoScheduleTaint) })
-	if equality.Semantic.DeepEqual(stored, node) {
-		return nil
-	}
-	return c.kubeClient.Patch(ctx, node, client.MergeFrom(stored))
+	first := true
+	// Retry a conflict here with a fresh read, since a requeue could call the provider again.
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		if !first {
+			if err := c.kubeClient.Get(ctx, client.ObjectKeyFromObject(node), node); err != nil {
+				return err
+			}
+		}
+		first = false
+		stored := node.DeepCopy()
+		node.Spec.Taints = lo.Reject(node.Spec.Taints, func(t corev1.Taint, _ int) bool { return t.MatchTaint(&v1.RebootingNoScheduleTaint) })
+		if equality.Semantic.DeepEqual(stored, node) {
+			return nil
+		}
+		// Use optimistic locking because a merge patch replaces the whole taint list and would undo changes made after the Node was read.
+		return c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+	})
 }
 
 func (c *Controller) removeInitializedLabel(ctx context.Context, node *corev1.Node) error {

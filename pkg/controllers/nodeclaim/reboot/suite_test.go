@@ -300,14 +300,37 @@ var _ = Describe("Reboot Lifecycle", func() {
 			race := &nodeTaintRaceClient{Client: env.Client, taint: quarantine}
 			racing := reboot.NewController(env.Clock, race, cloudProvider, terminator.NewTerminator(env.Clock, race, queue, recorder), recorder)
 
-			// Adding the taint can make the first Node patch fail with a conflict, so reconcile again.
-			_, _ = racing.Reconcile(ctx, ExpectExists(ctx, env.Client, nodeClaim))
+			// The other writer's taint makes the fence patch conflict, so the first reconcile requeues instead of failing.
+			result := ExpectObjectReconciled(ctx, env.Client, racing, nodeClaim)
 			ExpectObjectReconciled(ctx, env.Client, racing, nodeClaim)
 
 			Expect(race.raced).To(BeTrue())
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(node.Spec.Taints).To(ContainElement(quarantine))
 			Expect(hasRebootTaint(node)).To(BeTrue())
+			//nolint:staticcheck
+			Expect(result.Requeue).To(BeTrue())
+		})
+
+		It("keeps a taint that another writer adds while it removes the fence after the provider rejects the reboot", func() {
+			cloudProvider.NextRebootErr = cloudprovider.NewNodeRebootFailedError(fmt.Errorf("unauthorized"))
+			// The fence is already on, so removing it is the first patch that changes the Node's taints.
+			node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			quarantine := corev1.Taint{Key: "example.com/quarantine", Effect: corev1.TaintEffectNoSchedule}
+			race := &nodeTaintRaceClient{Client: env.Client, taint: quarantine}
+			racing := reboot.NewController(env.Clock, race, cloudProvider, terminator.NewTerminator(env.Clock, race, queue, recorder), recorder)
+
+			ExpectObjectReconciled(ctx, env.Client, racing, nodeClaim)
+			// Reconcile again, as a requeue would, to check the rejected reboot isn't sent to the provider again.
+			ExpectObjectReconciled(ctx, env.Client, racing, nodeClaim)
+
+			Expect(race.raced).To(BeTrue())
+			Expect(cloudProvider.RebootCalls).To(BeEmpty())
+			node = ExpectExists(ctx, env.Client, node)
+			Expect(node.Spec.Taints).To(ContainElement(quarantine))
+			Expect(hasRebootTaint(node)).To(BeFalse())
+			expectReplaced(nodeClaim, "provider_error")
 		})
 
 		It("skips issuing when the boot already changed after recording issuing state (restart safety)", func() {
@@ -553,8 +576,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			race := &nodeTaintRaceClient{Client: env.Client, taint: quarantine}
 			racing := reboot.NewController(env.Clock, race, cloudProvider, terminator.NewTerminator(env.Clock, race, queue, recorder), recorder)
 
-			// Adding the taint can make the first Node patch fail with a conflict, so reconcile again.
-			_, _ = racing.Reconcile(ctx, ExpectExists(ctx, env.Client, nodeClaim))
+			// The other writer's taint makes the fence removal conflict, and the controller retries it in the same reconcile.
 			ExpectObjectReconciled(ctx, env.Client, racing, nodeClaim)
 
 			Expect(race.raced).To(BeTrue())
