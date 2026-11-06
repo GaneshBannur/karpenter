@@ -44,6 +44,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -204,6 +205,10 @@ func (c *Controller) deleteNodeClaim(ctx context.Context, nodeClaim *v1.NodeClai
 	if err := c.kubeClient.Delete(ctx, nodeClaim); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
+	// The NodeClaim lifecycle controller only warns about deadlines it sets itself, so warn here.
+	if deadline, ok := nodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; ok {
+		c.recorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(nodeClaim, deadline))
+	}
 	// The deletion timestamp has successfully been set for the Node, update relevant metrics.
 	log.FromContext(ctx).Info("deleting unhealthy node")
 	labels := map[string]string{
@@ -267,6 +272,10 @@ func (c *Controller) annotateTerminationGracePeriod(ctx context.Context, nodeCla
 			return err
 		}
 		log.FromContext(ctx).WithValues(v1.NodeClaimTerminationTimestampAnnotationKey, terminationTime).Info("annotated nodeclaim")
+		// deleteNodeClaim skips a NodeClaim that is already deleting, so warn about its new deadline here.
+		if !nodeClaim.DeletionTimestamp.IsZero() {
+			c.recorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(nodeClaim, terminationTime))
+		}
 	}
 	return nil
 }

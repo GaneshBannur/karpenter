@@ -131,6 +131,16 @@ var _ = Describe("Dedupe", func() {
 		}
 		Expect(internalRecorder.Calls(terminatorevents.EvictPod(PodWithUID(), "").Reason)).To(Equal(100))
 	})
+	It("should only dedupe NodeClaim deadline warnings for the same NodeClaim and deadline", func() {
+		nodeClaim := NodeClaimWithUID()
+		deadline := "2026-01-01T01:00:00Z"
+		earlier := "2026-01-01T00:00:00Z"
+		eventRecorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(nodeClaim, deadline))
+		eventRecorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(nodeClaim, deadline))
+		eventRecorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(nodeClaim, earlier))
+		eventRecorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(NodeClaimWithUID(), deadline))
+		Expect(internalRecorder.Calls(events.TerminationGracePeriodExpiring)).To(Equal(3))
+	})
 })
 
 var _ = Describe("Rate Limiting", func() {

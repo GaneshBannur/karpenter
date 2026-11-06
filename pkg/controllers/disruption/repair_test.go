@@ -205,6 +205,7 @@ var _ = Describe("Repair", func() {
 		ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
 		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
 		ExpectMetricCounterValue(disruption.NodeClaimsUnhealthyDisruptedTotal, 1, metricLabels)
+		Expect(recorder.Calls(karpenterevents.TerminationGracePeriodExpiring)).To(Equal(0))
 		ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
 	})
@@ -920,6 +921,8 @@ var _ = Describe("Repair", func() {
 		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
 			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, deadline.Format(time.RFC3339)))
+		Expect(recorder.Calls(karpenterevents.TerminationGracePeriodExpiring)).To(Equal(1))
+		Expect(recorder.DetectedEvent("All pods will be deleted by " + deadline.Format(time.RFC3339))).To(BeTrue())
 	})
 
 	It("should retry a failed termination-deadline patch without losing the deadline", func() {
@@ -950,10 +953,14 @@ var _ = Describe("Repair", func() {
 		current := ExpectExists(ctx, env.Client, nodeClaim)
 		Expect(current.Annotations).ToNot(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
 		Expect(current.DeletionTimestamp.IsZero()).To(BeTrue())
+		Expect(recorder.Calls(karpenterevents.TerminationGracePeriodExpiring)).To(Equal(0))
 
 		ExpectObjectReconciled(ctx, failingClient, failingQueue, cmds[0].Candidates[0].NodeClaim)
+		deadline := env.Clock.Now().Format(time.RFC3339)
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
-			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Format(time.RFC3339)))
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, deadline))
+		Expect(recorder.Calls(karpenterevents.TerminationGracePeriodExpiring)).To(Equal(1))
+		Expect(recorder.DetectedEvent("All pods will be deleted by " + deadline)).To(BeTrue())
 	})
 
 	// When both the policy and the NodeClaim bound the drain, the smaller (most forceful) wins.

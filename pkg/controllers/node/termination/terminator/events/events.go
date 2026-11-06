@@ -91,6 +91,7 @@ func NodeClaimTerminationGracePeriodExpiring(nodeClaim *v1.NodeClaim, terminatio
 		Type:           corev1.EventTypeWarning,
 		Reason:         events.TerminationGracePeriodExpiring,
 		Message:        fmt.Sprintf("All pods will be deleted by %s", terminationTime),
-		DedupeValues:   []string{nodeClaim.Name},
+		// Include the deadline so a warning for a tightened deadline is not dropped as a duplicate.
+		DedupeValues: []string{nodeClaim.Name, terminationTime},
 	}
 }

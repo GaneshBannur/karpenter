@@ -50,6 +50,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -259,6 +260,10 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 			return
 		}
 		q.recorder.Publish(disruptionevents.Terminating(cmd.Candidates[i].Node, cmd.Candidates[i].NodeClaim, string(cmd.Reason()))...)
+		// The NodeClaim lifecycle controller only warns about deadlines it sets itself, so warn here.
+		if deadline, ok := cmd.Candidates[i].NodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; ok {
+			q.recorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(cmd.Candidates[i].NodeClaim, deadline))
+		}
 		recordCandidateDisrupted(cmd, cmd.Candidates[i])
 	})
 	// If there were any deletion failures, we should requeue.

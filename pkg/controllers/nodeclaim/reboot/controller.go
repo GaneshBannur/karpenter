@@ -46,6 +46,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
+	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	rebootevents "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/reboot/events"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -362,6 +363,10 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 		}
 		if err := c.kubeClient.Delete(ctx, nodeClaim, client.Preconditions{ResourceVersion: new(nodeClaim.ResourceVersion)}); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
+		}
+		// The NodeClaim lifecycle controller only warns about deadlines it sets itself, so warn here.
+		if deadline, ok := nodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; ok {
+			c.recorder.Publish(terminatorevents.NodeClaimTerminationGracePeriodExpiring(nodeClaim, deadline))
 		}
 		c.clearIssuanceStarted(nodeClaim.UID)
 		log.FromContext(ctx).WithValues("result", result).Info("reboot failed, replacing node")

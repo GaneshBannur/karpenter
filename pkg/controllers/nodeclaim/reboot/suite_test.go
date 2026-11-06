@@ -564,6 +564,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeTrue())
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue()).To(BeTrue())
 			Expect(recorder.Calls(events.RebootFailed)).To(Equal(0))
+			Expect(recorder.Calls(events.TerminationGracePeriodExpiring)).To(Equal(0))
 
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			expectReplaced(nodeClaim, "recovery_timeout")
@@ -571,6 +572,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			// Once deleting, termination owns the NodeClaim.
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
+			Expect(recorder.Calls(events.TerminationGracePeriodExpiring)).To(Equal(1))
 		})
 
 		It("stamps the reboot drain bound as the termination deadline when escalating to replacement", func() {
@@ -582,7 +584,13 @@ var _ = Describe("Reboot Lifecycle", func() {
 
 			expectReplaced(nodeClaim, "recovery_timeout")
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Add(5*time.Minute).Format(time.RFC3339)))
+			deadline := env.Clock.Now().Add(5 * time.Minute).Format(time.RFC3339)
+			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, deadline))
+			warnings := lo.FilterMap(recorder.Events(), func(e events.Event, _ int) (string, bool) {
+				_, onNodeClaim := e.InvolvedObject.(*v1.NodeClaim)
+				return e.Message, e.Reason == events.TerminationGracePeriodExpiring && onNodeClaim
+			})
+			Expect(warnings).To(ConsistOf("All pods will be deleted by " + deadline))
 			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		})
 
@@ -598,6 +606,8 @@ var _ = Describe("Reboot Lifecycle", func() {
 			expectReplaced(nodeClaim, "recovery_timeout")
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, earlier))
+			Expect(recorder.Calls(events.TerminationGracePeriodExpiring)).To(Equal(1))
+			Expect(recorder.DetectedEvent("All pods will be deleted by " + earlier)).To(BeTrue())
 			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		})
 
@@ -611,6 +621,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			expectReplaced(nodeClaim, "recovery_timeout")
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.Annotations).ToNot(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
+			Expect(recorder.Calls(events.TerminationGracePeriodExpiring)).To(Equal(0))
 			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		})
 
