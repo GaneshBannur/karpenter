@@ -487,6 +487,17 @@ var _ = Describe("Reboot Lifecycle", func() {
 			node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
 		})
 
+		It("ignores a rebooting NodeClaim that the cloud provider doesn't manage, even after the observation window", func() {
+			nodeClaim.Spec.NodeClassRef = &v1.NodeClassReference{Group: "karpenter.test.sh", Kind: "UnmanagedNodeClass", Name: "default"}
+			env.Clock.Step(21 * time.Minute)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp.IsZero()).To(BeTrue())
+			Expect(hasRebootTaint(ExpectExists(ctx, env.Client, node))).To(BeTrue())
+			Expect(recorder.Events()).To(BeEmpty())
+		})
+
 		It("clears the initialized label in the Issued phase (self-heals a crash after the transition)", func() {
 			// Simulate a crash after status was updated but before the label was cleared.
 			node.Labels[v1.NodeInitializedLabelKey] = "true"

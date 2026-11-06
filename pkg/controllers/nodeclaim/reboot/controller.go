@@ -101,7 +101,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			nc, ok := o.(*v1.NodeClaim)
 			// Predicates get the shared cached object; WithObservedOnly keeps StatusConditions() from initializing conditions on it
 			return ok && nc.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeRebooting) != nil
-		}))).
+		}), nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
 		WithOptions(controller.Options{RateLimiter: reasonable.RateLimiter(), MaxConcurrentReconciles: 10}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
@@ -109,6 +109,9 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 
+	if !nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider) {
+		return reconcile.Result{}, nil
+	}
 	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
 	// Only active reboots are reconciled here.
 	if cond == nil || !cond.IsTrue() {
