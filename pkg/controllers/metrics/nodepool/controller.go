@@ -26,6 +26,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -93,6 +94,17 @@ var (
 		[]opmetrics.Label{metrics.NodePool},
 		opmetrics.Alpha,
 	)
+	ReasonSpecificBudgetConfigured = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodePoolSubsystem,
+			Name:      "reason_specific_budget_configured",
+			Help:      "1 if one of the NodePool's disruption budgets lists the reason in its `reasons`, 0 if none does. A budget that doesn't set `reasons` applies to every reason, so it doesn't count. The budget's `nodes` value and schedule don't matter. Labeled by NodePool and reason.",
+		},
+		[]opmetrics.Label{metrics.NodePool, metrics.DisruptionReason},
+		opmetrics.Alpha,
+	)
 )
 
 type Controller struct {
@@ -144,6 +156,19 @@ func (c *Controller) buildMetrics(nodePool *v1.NodePool) (res []*metrics.StoreMe
 			GaugeMetric: DriftBackoffSeconds,
 			Labels:      map[string]string{metrics.NodePoolLabel: nodePool.Name},
 			Value:       remaining.Seconds(),
+		})
+	}
+	listedReasons := sets.New[string]()
+	for _, budget := range nodePool.Spec.Disruption.Budgets {
+		for _, reason := range budget.Reasons {
+			listedReasons.Insert(strings.ToLower(string(reason)))
+		}
+	}
+	for _, reason := range metrics.DisruptionReason.Values {
+		res = append(res, &metrics.StoreMetric{
+			GaugeMetric: ReasonSpecificBudgetConfigured,
+			Labels:      map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: reason.Name},
+			Value:       lo.Ternary(listedReasons.Has(reason.Name), 1.0, 0.0),
 		})
 	}
 

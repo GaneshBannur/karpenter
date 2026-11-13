@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
@@ -137,7 +138,7 @@ var _ = Describe("Metrics", func() {
 		}
 	})
 	It("should delete the nodepool state metrics on nodepool delete", func() {
-		expectedMetrics := []string{"karpenter_nodepools_limit", "karpenter_nodepools_usage"}
+		expectedMetrics := []string{"karpenter_nodepools_limit", "karpenter_nodepools_usage", "karpenter_nodepools_reason_specific_budget_configured"}
 		nodePool.Spec.Limits = v1.Limits{
 			corev1.ResourceCPU:              resource.MustParse("100"),
 			corev1.ResourceMemory:           resource.MustParse("100Mi"),
@@ -167,6 +168,43 @@ var _ = Describe("Metrics", func() {
 			})
 			Expect(found).To(BeFalse())
 		}
+	})
+	Context("reason-specific budget metric", func() {
+		expectReasonSpecificBudget := func(reason v1.DisruptionReason, value float64) {
+			GinkgoHelper()
+			ExpectMetricGaugeValue(nodepool.ReasonSpecificBudgetConfigured, value, map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+				metrics.ReasonLabel:   strings.ToLower(string(reason)),
+			})
+		}
+
+		It("should report 1 only for the reasons a budget lists", func() {
+			// Only the reasons matter, not the budgets' nodes values or schedules.
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{
+				{Nodes: "10%"},
+				{Nodes: "20%", Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}},
+				{Nodes: "0", Reasons: []v1.DisruptionReason{v1.DisruptionReasonDrifted, v1.DisruptionReasonUnhealthy}},
+				{Nodes: "5", Reasons: []v1.DisruptionReason{v1.DisruptionReasonEmpty}, Schedule: new("@daily"), Duration: &metav1.Duration{Duration: time.Hour}},
+			}
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+
+			expectReasonSpecificBudget(v1.DisruptionReasonUnhealthy, 1)
+			expectReasonSpecificBudget(v1.DisruptionReasonDrifted, 1)
+			expectReasonSpecificBudget(v1.DisruptionReasonEmpty, 1)
+			expectReasonSpecificBudget(v1.DisruptionReasonUnderutilized, 0)
+		})
+		It("should update the metric when the budgets change", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "20%", Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+			expectReasonSpecificBudget(v1.DisruptionReasonUnhealthy, 1)
+
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "20%"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+			expectReasonSpecificBudget(v1.DisruptionReasonUnhealthy, 0)
+		})
 	})
 	Context("drift backoff metric", func() {
 		const metricName = "karpenter_nodepools_drift_backoff_seconds"

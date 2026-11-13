@@ -18,6 +18,7 @@ package node
 
 import (
 	"context"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -55,6 +56,20 @@ var (
 	nodeNameLabel  = opmetrics.Label{Name: nodeName, Help: "The name of the node."}
 	nodePhaseLabel = opmetrics.Label{Name: nodePhase, Help: "The node's lifecycle phase, e.g. `Pending`, `Running`."}
 	managedLabel   = opmetrics.Label{Name: managed, Help: "Whether the node is managed by Karpenter.", Values: metrics.BoolValues}
+)
+
+// NodePoolDoNotRepairNodes is a NodePool metric, but it lives here because only this controller reads cluster state's
+// nodes.
+var NodePoolDoNotRepairNodes = opmetrics.NewPrometheusGauge(
+	crmetrics.Registry,
+	prometheus.GaugeOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: metrics.NodePoolSubsystem,
+		Name:      "do_not_repair_nodes",
+		Help:      "The number of the NodePool's nodes with the `karpenter.sh/do-not-repair` annotation set to `true`, which asks node repair not to act on them. Counts only nodes Karpenter manages, and not nodes being deleted. A NodePool with no such nodes reports 0; one with no nodes at all has no series. Labeled by NodePool.",
+	},
+	[]opmetrics.Label{metrics.NodePool},
+	opmetrics.Alpha,
 )
 
 var (
@@ -207,8 +222,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return client.ObjectKeyFromObject(n.Node).String(), buildMetrics(n)
 	})
 
-	// Build cluster level metric
+	// Build aggregate metrics
 	metricsMap["clusterUtilization"] = buildClusterUtilizationMetric(nodes)
+	maps.Copy(metricsMap, buildDoNotRepairNodesMetrics(nodes))
 
 	c.metricStore.ReplaceAll(metricsMap)
 
@@ -261,6 +277,33 @@ func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetri
 	}
 
 	return res
+}
+
+// buildDoNotRepairNodesMetrics gives each NodePool its own store key, because the store compares a key's old and new
+// series pairwise.
+func buildDoNotRepairNodesMetrics(nodes state.StateNodes) map[string][]*metrics.StoreMetric {
+	counts := map[string]int{}
+	for _, n := range nodes {
+		nodePool := n.Labels()[v1.NodePoolLabelKey]
+		if !n.Managed() || nodePool == "" {
+			continue
+		}
+		// Add the NodePool even when this node doesn't count, so it reports 0 instead of no series.
+		if _, ok := counts[nodePool]; !ok {
+			counts[nodePool] = 0
+		}
+		// Node repair compares the annotation the same way, in ShouldDisrupt.
+		if n.Annotations()[v1.DoNotRepairAnnotationKey] == "true" && !n.MarkedForDeletion() {
+			counts[nodePool]++
+		}
+	}
+	return lo.MapEntries(counts, func(nodePool string, count int) (string, []*metrics.StoreMetric) {
+		return "doNotRepairNodes/" + nodePool, []*metrics.StoreMetric{{
+			GaugeMetric: NodePoolDoNotRepairNodes,
+			Value:       float64(count),
+			Labels:      map[string]string{metrics.NodePoolLabel: nodePool},
+		}}
+	})
 }
 
 func buildMetrics(n *state.StateNode) (res []*metrics.StoreMetric) {
