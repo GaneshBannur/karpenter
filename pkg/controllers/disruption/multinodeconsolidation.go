@@ -59,19 +59,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	// the optimal consolidation command, this pre-filters out nodes that
 	// would have violated the budget anyway, preserving the ordering
 	// and only considering a number of nodes that can be disrupted.
-	disruptableCandidates := make([]*Candidate, 0, len(candidates))
-	constrainedByBudgets := false
-	for _, candidate := range candidates {
-		// If there's disruptions allowed for the candidate's nodepool,
-		// add it to the list of candidates, and decrement the budget.
-		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			constrainedByBudgets = true
-			continue
-		}
-		// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
-		disruptableCandidates = append(disruptableCandidates, candidate)
-		disruptionBudgetMapping[candidate.NodePool.Name]--
-	}
+	disruptableCandidates, constrainedByBudgets := filterByBudget(candidates, disruptionBudgetMapping)
 
 	// Only consider a maximum batch of 100 NodeClaims to save on computation.
 	// This could be further configurable in the future.
@@ -106,6 +94,24 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		return []Command{}, fmt.Errorf("validating consolidation, %w", err)
 	}
 	return []Command{cmd}, nil
+}
+
+// filterByBudget keeps candidates in order while their NodePool has budget left, using up that budget as it goes. It
+// also reports whether a budget left out any candidate.
+func filterByBudget(candidates []*Candidate, disruptionBudgetMapping map[string]int) ([]*Candidate, bool) {
+	disruptableCandidates := make([]*Candidate, 0, len(candidates))
+	constrainedByBudgets := false
+	for _, candidate := range candidates {
+		// If there's disruptions allowed for the candidate's nodepool,
+		// add it to the list of candidates, and decrement the budget.
+		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			constrainedByBudgets = true
+			continue
+		}
+		disruptableCandidates = append(disruptableCandidates, candidate)
+		disruptionBudgetMapping[candidate.NodePool.Name]--
+	}
+	return disruptableCandidates, constrainedByBudgets
 }
 
 // firstNConsolidationOption looks at the first N NodeClaims to determine if they can all be consolidated at once.  The

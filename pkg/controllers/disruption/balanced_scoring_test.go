@@ -407,6 +407,50 @@ var _ = Describe("Balanced Scoring", func() {
 		})
 	})
 
+	Describe("EvaluateMoveForAllPools", func() {
+		var np *v1.NodePool
+		var heavy, light *Candidate
+		var totals map[string]NodePoolTotals
+
+		BeforeEach(func() {
+			np = makeNodePool("pool-underutilized", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
+			// A cheap node with 20 pods costs far more to disrupt than it saves; a pricey node with 1 pod doesn't.
+			heavyPods := make([]*corev1.Pod, 20)
+			for i := range heavyPods {
+				heavyPods[i] = makePod(fmt.Sprintf("heavy-pod-%d", i), "")
+			}
+			heavy = makeCandidate("heavy", np, makeInstanceType("cheap", 1.0), heavyPods)
+			pool := []*Candidate{heavy}
+			for i := range 9 {
+				pool = append(pool, makeCandidate(fmt.Sprintf("light-%d", i), np, makeInstanceType("pricey", 10.0), []*corev1.Pod{makePod(fmt.Sprintf("light-pod-%d", i), "")}))
+			}
+			light = pool[1]
+			totals = computeNodePoolTotals(context.Background(), pool, candidateNodes(pool), nil)
+		})
+
+		It("should score a pool that isn't Balanced with Balanced's threshold", func() {
+			approved, perPool := EvaluateMoveForAllPools(context.Background(), Command{Candidates: []*Candidate{light}}, totals)
+			// savings_fraction = 10/91, disruption_fraction = 2/39, score ~= 2.14 >= 0.5
+			Expect(approved).To(BeTrue())
+			Expect(perPool).To(HaveKey(np.Name))
+			Expect(perPool[np.Name].K).To(Equal(v1.BalancedK))
+			Expect(perPool[np.Name].Score()).To(BeNumerically("~", (10.0/91)/(2.0/39), 1e-9))
+		})
+
+		It("should reject a move in a pool that isn't Balanced when its score is below Balanced's threshold", func() {
+			cmd := Command{Candidates: []*Candidate{heavy}}
+			approved, perPool := EvaluateMoveForAllPools(context.Background(), cmd, totals)
+			// savings_fraction = 1/91, disruption_fraction = 21/39, score ~= 0.02 < 0.5
+			Expect(approved).To(BeFalse())
+			Expect(perPool[np.Name].Score()).To(BeNumerically("~", (1.0/91)/(21.0/39), 1e-9))
+
+			// EvaluateBalancedMove skips the pool, so it approves the same move.
+			approved, perPool = EvaluateBalancedMove(context.Background(), cmd, totals)
+			Expect(approved).To(BeTrue())
+			Expect(perPool).ToNot(HaveKey(np.Name))
+		})
+	})
+
 	Describe("sumCandidatePrices", func() {
 		It("should return 0 for nil instanceType", func() {
 			np := makeNodePool("pool", v1.ConsolidationPolicyBalanced)

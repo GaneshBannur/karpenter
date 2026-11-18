@@ -129,6 +129,19 @@ func ComputeMoveDisruptionCost(candidates []*Candidate) float64 {
 // EvaluateBalancedMove scores each Balanced pool independently. Approved only
 // when every Balanced pool approves. Non-Balanced pools are skipped.
 func EvaluateBalancedMove(ctx context.Context, cmd Command, nodePoolTotals map[string]NodePoolTotals) (bool, map[string]ScoreResult) {
+	return evaluateMove(ctx, cmd, nodePoolTotals, func(nodePool *v1.NodePool) bool {
+		return nodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced()
+	})
+}
+
+// EvaluateMoveForAllPools scores every pool the way Balanced does, with Balanced's threshold, whatever the pool's
+// consolidation policy. Approved only when every pool approves.
+func EvaluateMoveForAllPools(ctx context.Context, cmd Command, nodePoolTotals map[string]NodePoolTotals) (bool, map[string]ScoreResult) {
+	return evaluateMove(ctx, cmd, nodePoolTotals, func(*v1.NodePool) bool { return true })
+}
+
+// evaluateMove scores the pools that shouldScore picks and skips the rest.
+func evaluateMove(ctx context.Context, cmd Command, nodePoolTotals map[string]NodePoolTotals, shouldScore func(*v1.NodePool) bool) (bool, map[string]ScoreResult) {
 	if len(cmd.Candidates) == 0 {
 		return false, nil
 	}
@@ -141,7 +154,7 @@ func EvaluateBalancedMove(ctx context.Context, cmd Command, nodePoolTotals map[s
 
 	for poolName, poolCandidates := range byPool {
 		nodePool := poolCandidates[0].NodePool
-		if !nodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced() {
+		if !shouldScore(nodePool) {
 			continue
 		}
 		disruptionCost := cmd.PoolDisruptionCost(poolName)
