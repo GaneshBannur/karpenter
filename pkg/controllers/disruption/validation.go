@@ -189,6 +189,24 @@ func NewMultiConsolidationValidator(c consolidation) *ConsolidationValidator {
 	}
 }
 
+func NewSampleAndDeleteValidator(c consolidation) *ConsolidationValidator {
+	s := &SampleAndDelete{consolidation: c}
+	return &ConsolidationValidator{
+		validation: validation{
+			clock:         c.clock,
+			cluster:       c.cluster,
+			kubeClient:    c.kubeClient,
+			provisioner:   c.provisioner,
+			cloudProvider: c.cloudProvider,
+			recorder:      c.recorder,
+			queue:         c.queue,
+			reason:        v1.DisruptionReasonUnderutilized,
+		},
+		filter:         s.ShouldDisrupt,
+		validationType: s.ConsolidationType(),
+	}
+}
+
 func (c *ConsolidationValidator) Validate(ctx context.Context, cmd Command, validationPeriod time.Duration) (Command, error) {
 	if err := c.isValid(ctx, cmd, validationPeriod); err != nil {
 		return Command{}, err

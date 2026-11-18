@@ -108,6 +108,13 @@ func NewMethods(ctx context.Context, clk clock.Clock, cluster *state.Cluster, ku
 	if options.FromContext(ctx).FeatureGates.NodeRepair && !options.FromContext(ctx).LegacyNodeRepair {
 		methods = append(methods, NewRepair(c))
 	}
+	// Sample-and-delete takes multi-node consolidation's place when its feature gate is enabled.
+	var multiNodeConsolidation Method
+	if options.FromContext(ctx).FeatureGates.SampleAndDeleteConsolidation {
+		multiNodeConsolidation = NewSampleAndDelete(c)
+	} else {
+		multiNodeConsolidation = NewMultiNodeConsolidation(c)
+	}
 	return append(methods, []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
@@ -116,7 +123,7 @@ func NewMethods(ctx context.Context, clk clock.Clock, cluster *state.Cluster, ku
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
 		NewDrift(kubeClient, cluster, provisioner, recorder, clk, queue.backoff),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
-		NewMultiNodeConsolidation(c),
+		multiNodeConsolidation,
 		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
 		NewSingleNodeConsolidation(c),
 	}...)

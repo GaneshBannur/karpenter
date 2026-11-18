@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -59,11 +60,19 @@ const (
 
 type MethodOptions struct {
 	validator Validator
+	rng       *rand.Rand
 }
 
 func WithValidator(v Validator) option.Function[MethodOptions] {
 	return func(o *MethodOptions) {
 		o.validator = v
+	}
+}
+
+// WithRand sets the random source a sampling method draws from, so tests can seed it.
+func WithRand(rng *rand.Rand) option.Function[MethodOptions] {
+	return func(o *MethodOptions) {
+		o.rng = rng
 	}
 }
 

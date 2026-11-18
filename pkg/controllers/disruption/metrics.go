@@ -46,13 +46,17 @@ var (
 		Name: "empty",
 		Help: "Consolidation that removes empty nodes.",
 	}
+	SampleAndDeleteConsolidationType = opmetrics.Value{
+		Name: "sample-and-delete",
+		Help: "Consolidation that removes a random sample of nodes at once, enabled by the SampleAndDeleteConsolidation feature gate in place of multi-node consolidation.",
+	}
 )
 
 var (
 	ConsolidationType = opmetrics.Label{
 		Name:   ConsolidationTypeLabel,
 		Help:   "The consolidation algorithm that produced the decision.",
-		Values: []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType, EmptyConsolidationType},
+		Values: []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType, EmptyConsolidationType, SampleAndDeleteConsolidationType},
 	}
 	// DecisionDim is the `decision` dimension for the voluntary-disruption decision
 	// counters, whose value is the command's action.
@@ -123,6 +127,7 @@ func init() {
 	// Initialize the consolidation_type series that can time out to 0. Only the
 	// multi- and single-node algorithms run a bounded search that can hit a timeout;
 	// empty-node consolidation does not, so it is not pre-initialized here.
+	// Sample-and-delete initializes its series when it is built, since a feature gate turns it on.
 	for _, ct := range []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType} {
 		ConsolidationTimeoutsTotal.Add(0, map[string]string{ConsolidationTypeLabel: ct.Name})
 	}
