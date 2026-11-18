@@ -476,7 +476,7 @@ var _ = Describe("SampleAndDeleteWeights", func() {
 		Entry("a weight above 1", "Utilization=2", "must be between 0 and 1"),
 		Entry("a weight that isn't a number", "Utilization=half,DisruptionCost=0.5", `parsing weight "Utilization"`),
 		Entry("NaN", "Utilization=NaN,DisruptionCost=0.5", "must be between 0 and 1"),
-		Entry("an unknown key", "Utilisation=0.5,DisruptionCost=0.5", `unknown weight "Utilisation"`),
+		Entry("an unknown key", "Price=0.5,DisruptionCost=0.5", `unknown weight "Price"`),
 		Entry("a pair without a value", "Utilization", "malformed pair"),
 	)
 	It("should fail to parse options with weights that don't add up to 1", func() {
