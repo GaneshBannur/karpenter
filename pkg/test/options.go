@@ -52,20 +52,22 @@ type OptionsFields struct {
 	LegacyNodeRepair                 *bool
 	FeatureGates                     FeatureGates
 	SchedulerConfig                  *options.SchedulerConfiguration
+	SampleAndDeleteWeights           *options.SampleAndDeleteWeights
 }
 
 type FeatureGates struct {
-	NodeRepair                *bool
-	ReservedCapacity          *bool
-	SpotToSpotConsolidation   *bool
-	NodeOverlay               *bool
-	StaticCapacity            *bool
-	CapacityBuffer            *bool
-	TerminateFirstDrift       *bool
-	TerminateFirstRepair      *bool
-	PodDeletionCostManagement *bool
-	PredictionEnabled         *bool
-	NodePoolDriftBackoff      *bool
+	NodeRepair                   *bool
+	ReservedCapacity             *bool
+	SpotToSpotConsolidation      *bool
+	NodeOverlay                  *bool
+	StaticCapacity               *bool
+	CapacityBuffer               *bool
+	TerminateFirstDrift          *bool
+	TerminateFirstRepair         *bool
+	PodDeletionCostManagement    *bool
+	PredictionEnabled            *bool
+	NodePoolDriftBackoff         *bool
+	SampleAndDeleteConsolidation *bool
 }
 
 func Options(overrides ...OptionsFields) *options.Options {
@@ -98,18 +100,20 @@ func Options(overrides ...OptionsFields) *options.Options {
 		IgnoreDRARequests:                lo.FromPtrOr(opts.IgnoreDRARequests, true),
 		LegacyNodeRepair:                 lo.FromPtrOr(opts.LegacyNodeRepair, false),
 		SchedulerConfig:                  opts.SchedulerConfig,
+		SampleAndDeleteWeights:           lo.FromPtrOr(opts.SampleAndDeleteWeights, options.DefaultSampleAndDeleteWeights),
 		FeatureGates: options.FeatureGates{
-			NodeRepair:                lo.FromPtrOr(opts.FeatureGates.NodeRepair, options.NodeRepairFeatureGate.Default),
-			ReservedCapacity:          lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, options.ReservedCapacityFeatureGate.Default),
-			SpotToSpotConsolidation:   lo.FromPtrOr(opts.FeatureGates.SpotToSpotConsolidation, options.SpotToSpotConsolidationFeatureGate.Default),
-			NodeOverlay:               lo.FromPtrOr(opts.FeatureGates.NodeOverlay, options.NodeOverlayFeatureGate.Default),
-			StaticCapacity:            lo.FromPtrOr(opts.FeatureGates.StaticCapacity, options.StaticCapacityFeatureGate.Default),
-			CapacityBuffer:            lo.FromPtrOr(opts.FeatureGates.CapacityBuffer, options.CapacityBufferFeatureGate.Default),
-			TerminateFirstDrift:       lo.FromPtrOr(opts.FeatureGates.TerminateFirstDrift, options.TerminateFirstDriftFeatureGate.Default),
-			TerminateFirstRepair:      lo.FromPtrOr(opts.FeatureGates.TerminateFirstRepair, options.TerminateFirstRepairFeatureGate.Default),
-			PodDeletionCostManagement: lo.FromPtrOr(opts.FeatureGates.PodDeletionCostManagement, options.PodDeletionCostManagementFeatureGate.Default),
-			PredictionEnabled:         lo.FromPtrOr(opts.FeatureGates.PredictionEnabled, options.PredictionEnabledFeatureGate.Default),
-			NodePoolDriftBackoff:      lo.FromPtrOr(opts.FeatureGates.NodePoolDriftBackoff, options.NodePoolDriftBackoffFeatureGate.Default),
+			NodeRepair:                   lo.FromPtrOr(opts.FeatureGates.NodeRepair, options.NodeRepairFeatureGate.Default),
+			ReservedCapacity:             lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, options.ReservedCapacityFeatureGate.Default),
+			SpotToSpotConsolidation:      lo.FromPtrOr(opts.FeatureGates.SpotToSpotConsolidation, options.SpotToSpotConsolidationFeatureGate.Default),
+			NodeOverlay:                  lo.FromPtrOr(opts.FeatureGates.NodeOverlay, options.NodeOverlayFeatureGate.Default),
+			StaticCapacity:               lo.FromPtrOr(opts.FeatureGates.StaticCapacity, options.StaticCapacityFeatureGate.Default),
+			CapacityBuffer:               lo.FromPtrOr(opts.FeatureGates.CapacityBuffer, options.CapacityBufferFeatureGate.Default),
+			TerminateFirstDrift:          lo.FromPtrOr(opts.FeatureGates.TerminateFirstDrift, options.TerminateFirstDriftFeatureGate.Default),
+			TerminateFirstRepair:         lo.FromPtrOr(opts.FeatureGates.TerminateFirstRepair, options.TerminateFirstRepairFeatureGate.Default),
+			PodDeletionCostManagement:    lo.FromPtrOr(opts.FeatureGates.PodDeletionCostManagement, options.PodDeletionCostManagementFeatureGate.Default),
+			PredictionEnabled:            lo.FromPtrOr(opts.FeatureGates.PredictionEnabled, options.PredictionEnabledFeatureGate.Default),
+			NodePoolDriftBackoff:         lo.FromPtrOr(opts.FeatureGates.NodePoolDriftBackoff, options.NodePoolDriftBackoffFeatureGate.Default),
+			SampleAndDeleteConsolidation: lo.FromPtrOr(opts.FeatureGates.SampleAndDeleteConsolidation, options.SampleAndDeleteConsolidationFeatureGate.Default),
 		},
 	}
 }

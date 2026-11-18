@@ -68,6 +68,7 @@ var _ = Describe("Options", func() {
 		"FEATURE_GATES",
 		"SCHEDULER_CONFIG",
 		"LEGACY_NODE_REPAIR",
+		"SAMPLE_AND_DELETE_WEIGHTS",
 	}
 
 	BeforeEach(func() {
@@ -163,6 +164,7 @@ var _ = Describe("Options", func() {
 				"--min-values-policy", "BestEffort",
 				"--feature-gates", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true,NodeOverlay=true,StaticCapacity=true,CapacityBuffer=true,NodePoolDriftBackoff=true",
 				"--scheduler-config", `{"podTopologySpread":{"defaultConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway"}]}}`,
+				"--sample-and-delete-weights", "Utilization=0.4,DisruptionCost=0.4,Drift=0.2",
 			)
 			Expect(err).To(BeNil())
 			expectOptionsMatch(opts, test.Options(test.OptionsFields{
@@ -204,6 +206,7 @@ var _ = Describe("Options", func() {
 						}},
 					},
 				},
+				SampleAndDeleteWeights: &options.SampleAndDeleteWeights{Utilization: 0.4, DisruptionCost: 0.4, Drift: 0.2},
 			}))
 		})
 
@@ -229,6 +232,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("MIN_VALUES_POLICY", "BestEffort")
 			os.Setenv("FEATURE_GATES", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true,NodeOverlay=true,StaticCapacity=true,CapacityBuffer=true,NodePoolDriftBackoff=true")
 			os.Setenv("SCHEDULER_CONFIG", `{"podTopologySpread":{"defaultConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway"}]}}`)
+			os.Setenv("SAMPLE_AND_DELETE_WEIGHTS", "Utilization=0.4,DisruptionCost=0.4,Drift=0.2")
 			fs = &options.FlagSet{
 				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
 			}
@@ -274,6 +278,7 @@ var _ = Describe("Options", func() {
 						}},
 					},
 				},
+				SampleAndDeleteWeights: &options.SampleAndDeleteWeights{Utilization: 0.4, DisruptionCost: 0.4, Drift: 0.2},
 			}))
 		})
 
@@ -371,6 +376,7 @@ var _ = Describe("Options", func() {
 			Entry("when TerminateFirstDrift is overridden", "TerminateFirstDrift"),
 			Entry("when TerminateFirstRepair is overridden", "TerminateFirstRepair"),
 			Entry("when NodePoolDriftBackoff is overridden", "NodePoolDriftBackoff"),
+			Entry("when SampleAndDeleteConsolidation is overridden", "SampleAndDeleteConsolidation"),
 		)
 	})
 
@@ -429,6 +435,57 @@ var _ = Describe("Options", func() {
 		)
 	})
 
+})
+
+var _ = Describe("SampleAndDeleteWeights", func() {
+	It("should default to the plain average of utilization and disruption cost", func() {
+		Expect(options.DefaultSampleAndDeleteWeights).To(Equal(options.SampleAndDeleteWeights{Utilization: 0.5, DisruptionCost: 0.5}))
+		weights, err := options.ParseSampleAndDeleteWeights(options.DefaultSampleAndDeleteWeights.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(weights).To(Equal(options.DefaultSampleAndDeleteWeights))
+	})
+	It("should list every weight when formatted", func() {
+		Expect(options.SampleAndDeleteWeights{Utilization: 0.4, DisruptionCost: 0.3, Drift: 0.1, Repair: 0.1, Expiration: 0.1}.String()).
+			To(Equal("Utilization=0.4,DisruptionCost=0.3,Drift=0.1,Repair=0.1,Expiration=0.1"))
+	})
+	DescribeTable("should parse weights that add up to 1",
+		func(raw string, expected options.SampleAndDeleteWeights) {
+			weights, err := options.ParseSampleAndDeleteWeights(raw)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(weights).To(Equal(expected))
+		},
+		Entry("all five weights", "Utilization=0.2,DisruptionCost=0.2,Drift=0.2,Repair=0.2,Expiration=0.2",
+			options.SampleAndDeleteWeights{Utilization: 0.2, DisruptionCost: 0.2, Drift: 0.2, Repair: 0.2, Expiration: 0.2}),
+		Entry("a weight that isn't listed weighs 0", "Utilization=0.7,DisruptionCost=0.3",
+			options.SampleAndDeleteWeights{Utilization: 0.7, DisruptionCost: 0.3}),
+		Entry("a single weight of 1", "Expiration=1", options.SampleAndDeleteWeights{Expiration: 1}),
+		Entry("whitespace around keys and values", " Utilization = 0.5 , DisruptionCost = 0.5 ",
+			options.SampleAndDeleteWeights{Utilization: 0.5, DisruptionCost: 0.5}),
+		Entry("decimals with float rounding", "Utilization=0.7,DisruptionCost=0.1,Drift=0.1,Repair=0.1",
+			options.SampleAndDeleteWeights{Utilization: 0.7, DisruptionCost: 0.1, Drift: 0.1, Repair: 0.1}),
+	)
+	DescribeTable("should refuse weights that are invalid",
+		func(raw string, message string) {
+			_, err := options.ParseSampleAndDeleteWeights(raw)
+			Expect(err).To(MatchError(ContainSubstring(message)))
+		},
+		Entry("a sum below 1", "Utilization=0.5,DisruptionCost=0.4", "weights must add up to 1, got 0.9"),
+		Entry("a sum above 1", "Utilization=0.5,DisruptionCost=0.5,Drift=0.5", "weights must add up to 1, got 1.5"),
+		Entry("no weights", "", "weights must add up to 1, got 0"),
+		Entry("a negative weight", "Utilization=1.5,DisruptionCost=-0.5", "must be between 0 and 1"),
+		Entry("a weight above 1", "Utilization=2", "must be between 0 and 1"),
+		Entry("a weight that isn't a number", "Utilization=half,DisruptionCost=0.5", `parsing weight "Utilization"`),
+		Entry("NaN", "Utilization=NaN,DisruptionCost=0.5", "must be between 0 and 1"),
+		Entry("an unknown key", "Utilisation=0.5,DisruptionCost=0.5", `unknown weight "Utilisation"`),
+		Entry("a pair without a value", "Utilization", "malformed pair"),
+	)
+	It("should fail to parse options with weights that don't add up to 1", func() {
+		fs := &options.FlagSet{FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError)}
+		opts := &options.Options{}
+		opts.AddFlags(fs)
+		err := opts.Parse(fs, "--sample-and-delete-weights", "Utilization=0.6,DisruptionCost=0.6")
+		Expect(err).To(MatchError(ContainSubstring("parsing sample-and-delete weights, weights must add up to 1")))
+	})
 })
 
 var _ = Describe("SchedulerConfiguration", func() {
@@ -608,7 +665,9 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.FeatureGates.TerminateFirstDrift).To(Equal(optsB.FeatureGates.TerminateFirstDrift))
 	Expect(optsA.FeatureGates.TerminateFirstRepair).To(Equal(optsB.FeatureGates.TerminateFirstRepair))
 	Expect(optsA.FeatureGates.NodePoolDriftBackoff).To(Equal(optsB.FeatureGates.NodePoolDriftBackoff))
+	Expect(optsA.FeatureGates.SampleAndDeleteConsolidation).To(Equal(optsB.FeatureGates.SampleAndDeleteConsolidation))
 	Expect(optsA.IgnoreDRARequests).To(Equal(optsB.IgnoreDRARequests))
 	Expect(optsA.LegacyNodeRepair).To(Equal(optsB.LegacyNodeRepair))
 	Expect(optsA.SchedulerConfig).To(Equal(optsB.SchedulerConfig))
+	Expect(optsA.SampleAndDeleteWeights).To(Equal(optsB.SampleAndDeleteWeights))
 }

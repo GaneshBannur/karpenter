@@ -21,7 +21,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
+	"math"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,17 +65,18 @@ type optionsKey struct{}
 type FeatureGates struct {
 	inputStr string
 
-	NodeRepair                bool
-	ReservedCapacity          bool
-	SpotToSpotConsolidation   bool
-	NodeOverlay               bool
-	StaticCapacity            bool
-	CapacityBuffer            bool
-	TerminateFirstDrift       bool
-	TerminateFirstRepair      bool
-	PodDeletionCostManagement bool
-	PredictionEnabled         bool
-	NodePoolDriftBackoff      bool
+	NodeRepair                   bool
+	ReservedCapacity             bool
+	SpotToSpotConsolidation      bool
+	NodeOverlay                  bool
+	StaticCapacity               bool
+	CapacityBuffer               bool
+	TerminateFirstDrift          bool
+	TerminateFirstRepair         bool
+	PodDeletionCostManagement    bool
+	PredictionEnabled            bool
+	NodePoolDriftBackoff         bool
+	SampleAndDeleteConsolidation bool
 }
 
 // FeatureGate is the source-of-truth description of a feature gate. Declaring gates as FeatureGates keeps each gate's
@@ -165,6 +170,14 @@ var (
 		Help: "Karpenter backs off drift disruption for a NodePool after its drift replacements fail, so a NodePool " +
 			"that can't launch replacements doesn't keep cycling drifted nodes.",
 	}
+	SampleAndDeleteConsolidationFeatureGate = FeatureGate{
+		Name:    "SampleAndDeleteConsolidation",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Karpenter replaces multi-node consolidation with sample-and-delete consolidation. It picks a random " +
+			"group of nodes, favoring nodes with low utilization and low disruption cost, and removes them together when " +
+			"the savings justify the disruption. --sample-and-delete-weights tunes how nodes are picked.",
+	}
 )
 
 // KarpenterFeatureGates are the feature gates Karpenter supports, in the order --feature-gates lists them.
@@ -180,6 +193,7 @@ var KarpenterFeatureGates = []FeatureGate{
 	PodDeletionCostManagementFeatureGate,
 	PredictionEnabledFeatureGate,
 	NodePoolDriftBackoffFeatureGate,
+	SampleAndDeleteConsolidationFeatureGate,
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -211,6 +225,8 @@ type Options struct {
 	FeatureGates                     FeatureGates
 	schedulerConfigRaw               string
 	SchedulerConfig                  *SchedulerConfiguration
+	sampleAndDeleteWeightsRaw        string
+	SampleAndDeleteWeights           SampleAndDeleteWeights
 }
 
 type FlagSet struct {
@@ -255,6 +271,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.BoolVarWithEnv(&o.LegacyNodeRepair, "legacy-node-repair", "LEGACY_NODE_REPAIR", false, "When set with the NodeRepair feature gate, Karpenter runs the legacy node repair controller instead of node repair as a disruption method. The legacy controller only replaces nodes: it does not support terminate-first repair, reboot, repair policy priority or termination grace periods, or the karpenter.sh/do-not-repair annotation. NOTE: The legacy node repair controller is planned for deprecation. If you use it because the new one does not work for you, please open an issue with your use case or problem.")
 	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", featureGatesDefault()), featureGatesHelp())
 	fs.StringVar(&o.schedulerConfigRaw, "scheduler-config", env.WithDefaultString("SCHEDULER_CONFIG", ""), "A YAML/JSON document configuring the parts of the cluster's kube-scheduler behavior that Karpenter must mirror during scheduling simulation, currently only podTopologySpread.defaultConstraints. Empty means no scheduler-config overrides.")
+	fs.StringVar(&o.sampleAndDeleteWeightsRaw, "sample-and-delete-weights", env.WithDefaultString("SAMPLE_AND_DELETE_WEIGHTS", DefaultSampleAndDeleteWeights.String()), "Comma separated Key=weight pairs that tune how sample-and-delete consolidation picks nodes, used when the SampleAndDeleteConsolidation feature gate is enabled. Keys are Utilization, DisruptionCost, Drift, Repair and Expiration, and a key that isn't listed weighs 0. Each weight must be between 0 and 1, and the weights must add up to 1.")
 }
 
 func (o *Options) Parse(fs *FlagSet, args ...string) error {
@@ -286,6 +303,11 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 		return fmt.Errorf("parsing scheduler config, %w", err)
 	}
 	o.SchedulerConfig = schedulerConfig
+	sampleAndDeleteWeights, err := ParseSampleAndDeleteWeights(o.sampleAndDeleteWeightsRaw)
+	if err != nil {
+		return fmt.Errorf("parsing sample-and-delete weights, %w", err)
+	}
+	o.SampleAndDeleteWeights = sampleAndDeleteWeights
 	o.PreferencePolicy = PreferencePolicy(o.preferencePolicyRaw)
 	o.MinValuesPolicy = MinValuesPolicy(o.minValuesPolicyRaw)
 	return nil
@@ -297,17 +319,18 @@ func (o *Options) ToContext(ctx context.Context) context.Context {
 
 func DefaultFeatureGates() FeatureGates {
 	return FeatureGates{
-		NodeRepair:                NodeRepairFeatureGate.Default,
-		ReservedCapacity:          ReservedCapacityFeatureGate.Default,
-		SpotToSpotConsolidation:   SpotToSpotConsolidationFeatureGate.Default,
-		NodeOverlay:               NodeOverlayFeatureGate.Default,
-		StaticCapacity:            StaticCapacityFeatureGate.Default,
-		CapacityBuffer:            CapacityBufferFeatureGate.Default,
-		TerminateFirstDrift:       TerminateFirstDriftFeatureGate.Default,
-		TerminateFirstRepair:      TerminateFirstRepairFeatureGate.Default,
-		PodDeletionCostManagement: PodDeletionCostManagementFeatureGate.Default,
-		PredictionEnabled:         PredictionEnabledFeatureGate.Default,
-		NodePoolDriftBackoff:      NodePoolDriftBackoffFeatureGate.Default,
+		NodeRepair:                   NodeRepairFeatureGate.Default,
+		ReservedCapacity:             ReservedCapacityFeatureGate.Default,
+		SpotToSpotConsolidation:      SpotToSpotConsolidationFeatureGate.Default,
+		NodeOverlay:                  NodeOverlayFeatureGate.Default,
+		StaticCapacity:               StaticCapacityFeatureGate.Default,
+		CapacityBuffer:               CapacityBufferFeatureGate.Default,
+		TerminateFirstDrift:          TerminateFirstDriftFeatureGate.Default,
+		TerminateFirstRepair:         TerminateFirstRepairFeatureGate.Default,
+		PodDeletionCostManagement:    PodDeletionCostManagementFeatureGate.Default,
+		PredictionEnabled:            PredictionEnabledFeatureGate.Default,
+		NodePoolDriftBackoff:         NodePoolDriftBackoffFeatureGate.Default,
+		SampleAndDeleteConsolidation: SampleAndDeleteConsolidationFeatureGate.Default,
 	}
 }
 
@@ -321,17 +344,18 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 		return gates, err
 	}
 	for name, gate := range map[string]*bool{
-		NodeRepairFeatureGate.Name:                &gates.NodeRepair,
-		SpotToSpotConsolidationFeatureGate.Name:   &gates.SpotToSpotConsolidation,
-		ReservedCapacityFeatureGate.Name:          &gates.ReservedCapacity,
-		NodeOverlayFeatureGate.Name:               &gates.NodeOverlay,
-		StaticCapacityFeatureGate.Name:            &gates.StaticCapacity,
-		CapacityBufferFeatureGate.Name:            &gates.CapacityBuffer,
-		TerminateFirstDriftFeatureGate.Name:       &gates.TerminateFirstDrift,
-		TerminateFirstRepairFeatureGate.Name:      &gates.TerminateFirstRepair,
-		PodDeletionCostManagementFeatureGate.Name: &gates.PodDeletionCostManagement,
-		PredictionEnabledFeatureGate.Name:         &gates.PredictionEnabled,
-		NodePoolDriftBackoffFeatureGate.Name:      &gates.NodePoolDriftBackoff,
+		NodeRepairFeatureGate.Name:                   &gates.NodeRepair,
+		SpotToSpotConsolidationFeatureGate.Name:      &gates.SpotToSpotConsolidation,
+		ReservedCapacityFeatureGate.Name:             &gates.ReservedCapacity,
+		NodeOverlayFeatureGate.Name:                  &gates.NodeOverlay,
+		StaticCapacityFeatureGate.Name:               &gates.StaticCapacity,
+		CapacityBufferFeatureGate.Name:               &gates.CapacityBuffer,
+		TerminateFirstDriftFeatureGate.Name:          &gates.TerminateFirstDrift,
+		TerminateFirstRepairFeatureGate.Name:         &gates.TerminateFirstRepair,
+		PodDeletionCostManagementFeatureGate.Name:    &gates.PodDeletionCostManagement,
+		PredictionEnabledFeatureGate.Name:            &gates.PredictionEnabled,
+		NodePoolDriftBackoffFeatureGate.Name:         &gates.NodePoolDriftBackoff,
+		SampleAndDeleteConsolidationFeatureGate.Name: &gates.SampleAndDeleteConsolidation,
 	} {
 		if val, ok := gateMap[name]; ok {
 			*gate = val
@@ -339,6 +363,74 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 
 	return gates, nil
+}
+
+// SampleAndDeleteWeights weigh the terms that sample-and-delete consolidation averages into the chance of picking a
+// node: P(Delete) = 1 - (Utilization*U + DisruptionCost*DC + Drift*D + Repair*R + Expiration*E). They add up to 1.
+type SampleAndDeleteWeights struct {
+	Utilization    float64
+	DisruptionCost float64
+	Drift          float64
+	Repair         float64
+	Expiration     float64
+}
+
+// DefaultSampleAndDeleteWeights give the plain average of utilization and disruption cost.
+var DefaultSampleAndDeleteWeights = SampleAndDeleteWeights{Utilization: 0.5, DisruptionCost: 0.5}
+
+// sampleAndDeleteWeightSumTolerance absorbs float rounding when decimal weights are added up.
+const sampleAndDeleteWeightSumTolerance = 1e-9
+
+// weightField pairs a weight with its --sample-and-delete-weights key.
+type weightField struct {
+	key   string
+	value *float64
+}
+
+func (w *SampleAndDeleteWeights) weightFields() []weightField {
+	return []weightField{
+		{key: "Utilization", value: &w.Utilization},
+		{key: "DisruptionCost", value: &w.DisruptionCost},
+		{key: "Drift", value: &w.Drift},
+		{key: "Repair", value: &w.Repair},
+		{key: "Expiration", value: &w.Expiration},
+	}
+}
+
+// String formats the weights the way --sample-and-delete-weights takes them.
+func (w SampleAndDeleteWeights) String() string {
+	return strings.Join(lo.Map(w.weightFields(), func(f weightField, _ int) string {
+		return f.key + "=" + strconv.FormatFloat(*f.value, 'g', -1, 64)
+	}), ",")
+}
+
+// ParseSampleAndDeleteWeights parses comma separated Key=weight pairs. A key that isn't listed weighs 0.
+func ParseSampleAndDeleteWeights(raw string) (SampleAndDeleteWeights, error) {
+	pairs := map[string]string{}
+	if err := cliflag.NewMapStringString(&pairs).Set(raw); err != nil {
+		return SampleAndDeleteWeights{}, err
+	}
+	weights := SampleAndDeleteWeights{}
+	fields := weights.weightFields()
+	for _, key := range slices.Sorted(maps.Keys(pairs)) {
+		field, ok := lo.Find(fields, func(f weightField) bool { return f.key == key })
+		if !ok {
+			return SampleAndDeleteWeights{}, fmt.Errorf("unknown weight %q, must be one of %s", key,
+				strings.Join(lo.Map(fields, func(f weightField, _ int) string { return f.key }), ", "))
+		}
+		weight, err := strconv.ParseFloat(pairs[key], 64)
+		if err != nil {
+			return SampleAndDeleteWeights{}, fmt.Errorf("parsing weight %q, %w", key, err)
+		}
+		if math.IsNaN(weight) || weight < 0 || weight > 1 {
+			return SampleAndDeleteWeights{}, fmt.Errorf("weight %q must be between 0 and 1, got %s", key, pairs[key])
+		}
+		*field.value = weight
+	}
+	if sum := lo.SumBy(fields, func(f weightField) float64 { return *f.value }); math.Abs(sum-1) > sampleAndDeleteWeightSumTolerance {
+		return SampleAndDeleteWeights{}, fmt.Errorf("weights must add up to 1, got %s", strconv.FormatFloat(sum, 'g', -1, 64))
+	}
+	return weights, nil
 }
 
 // SchedulerConfiguration is a Karpenter-owned configuration type that mirrors the parts of the cluster's
